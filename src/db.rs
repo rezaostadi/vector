@@ -1,5 +1,4 @@
 use anyhow::Context;
-use axum::Extension;
 use lazy_static::lazy_static;
 use rayon::prelude::*;
 use schemars::JsonSchema;
@@ -7,18 +6,13 @@ use std::{
 	collections::{BinaryHeap, HashMap},
 	fs,
 	path::PathBuf,
-	sync::Arc,
 };
-use tokio::sync::RwLock;
 
 use crate::similarity::{get_cache_attr, get_distance_fn, normalize, Distance, ScoreIndex};
 
 lazy_static! {
 	pub static ref STORE_PATH: PathBuf = PathBuf::from("./storage/db");
 }
-
-#[allow(clippy::module_name_repetitions)]
-pub type DbExtension = Extension<Arc<RwLock<Db>>>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -39,8 +33,8 @@ pub struct Db {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
 pub struct SimilarityResult {
-	score: f32,
-	embedding: Embedding,
+	pub score: f32,
+	pub embedding: Embedding,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, JsonSchema)]
@@ -54,10 +48,26 @@ pub struct Collection {
 	pub embeddings: Vec<Embedding>,
 }
 
+fn always_true(_: &Embedding) -> bool {
+	true
+}
+
 impl Collection {
-	pub fn get_similarity(&self, query: &[f32], k: usize) -> Vec<SimilarityResult> {
+	pub fn get_similarity(
+		&self,
+		query: &[f32],
+		k: usize,
+		predicate_fn: Option<&dyn Fn(&Embedding) -> bool>,
+		threshold: Option<f32>,
+	) -> Vec<SimilarityResult> {
+		let threshold = threshold.unwrap_or(-1.0);
 		let memo_attr = get_cache_attr(self.distance, query);
 		let distance_fn = get_distance_fn(self.distance);
+
+		let predicate_fn = match predicate_fn {
+			Some(predicate_fn) => predicate_fn,
+			None => &always_true,
+		};
 
 		let scores = self
 			.embeddings
@@ -71,7 +81,10 @@ impl Collection {
 
 		let mut heap = BinaryHeap::new();
 		for score_index in scores {
-			if heap.len() < k || score_index < *heap.peek().unwrap() {
+			if (heap.len() < k || score_index < *heap.peek().unwrap())
+				&& score_index.score >= threshold
+				&& predicate_fn(&self.embeddings[score_index.index])
+			{
 				heap.push(score_index);
 
 				if heap.len() > k {
@@ -102,10 +115,6 @@ impl Db {
 		Self {
 			collections: HashMap::new(),
 		}
-	}
-
-	pub fn extension(self) -> DbExtension {
-		Extension(Arc::new(RwLock::new(self)))
 	}
 
 	pub fn create_collection(
